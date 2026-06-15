@@ -41,6 +41,7 @@ class RagContext:
     image_collection: Any = None
     frame_timestamps: dict = field(default_factory=dict)
     image_data: list = field(default_factory=list)   # for image mode (b64 payloads)
+    file_path: str = None                             # original uploaded file path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -64,6 +65,7 @@ def ingest_video(video_path: str) -> RagContext:
         text_collection=text_collection,
         image_collection=image_collection,
         frame_timestamps=frame_timestamps,
+        file_path=video_path,
     )
 
 
@@ -76,7 +78,7 @@ def ingest_audio(audio_path: str) -> RagContext:
     text_collection, _ = get_collections()
     text_collection = populate_text(document, text_collection) or text_collection
 
-    return RagContext(rag_type="audio", text_collection=text_collection)
+    return RagContext(rag_type="audio", text_collection=text_collection, file_path=audio_path)
 
 
 def ingest_document(doc_path: str) -> RagContext:
@@ -86,14 +88,14 @@ def ingest_document(doc_path: str) -> RagContext:
     text_collection, _ = get_collections()
     text_collection = populate_text(document, text_collection) or text_collection
 
-    return RagContext(rag_type="document", text_collection=text_collection)
+    return RagContext(rag_type="document", text_collection=text_collection, file_path=doc_path)
 
 
 def ingest_image(img_path: str) -> RagContext:
     """Encode an image once; no vector store needed (sent inline to the LLM)."""
     print(f"Ingesting image: {img_path}")
     img_data = {"b64": encode_image_to_base64(img_path)}
-    return RagContext(rag_type="image", image_data=[img_data])
+    return RagContext(rag_type="image", image_data=[img_data], file_path=img_path)
 
 
 def ingest(rag_type: str, file_path: str) -> RagContext:
@@ -113,25 +115,60 @@ def ingest(rag_type: str, file_path: str) -> RagContext:
 # QUERYING  — light, runs for every follow-up question
 # ──────────────────────────────────────────────────────────────────────────────
 
-def query(ctx: RagContext, query_str: str) -> str:
-    """Answer a question using an already-ingested ``RagContext``."""
+def query(ctx: RagContext, query_str: str) -> tuple:
+    """Answer a question using an already-ingested ``RagContext``.
+
+    Returns
+    -------
+    (answer: str, top_context: dict | None)
+        top_context keys vary by type:
+          video  → {"type": "video",    "timestamp": float, "file_path": str}
+          audio  → {"type": "audio",    "timestamp": float | None, "file_path": str}
+          document → {"type": "document", "text": str}
+          image  → {"type": "image",    "b64": str}
+    """
     if ctx.rag_type == "video":
         retrieved_texts, retrieved_images = video_retrival(
             query_str, ctx.text_collection, ctx.image_collection,
             ctx.frame_timestamps, top_k=5,
         )
-        return ask(query_str, retrieved_texts, retrieved_images, type="video")
+        answer = ask(query_str, retrieved_texts, retrieved_images, type="video")
+        top_ctx = None
+        if retrieved_images:
+            top = retrieved_images[0]
+            top_ctx = {
+                "type": "video",
+                "timestamp": top.get("timestamp"),
+                "file_path": ctx.file_path if hasattr(ctx, "file_path") else None,
+            }
+        return answer, top_ctx
 
     if ctx.rag_type == "audio":
         retrieved_texts = text_retrieval(query_str, ctx.text_collection, top_k=3)
-        return ask(query_str, retrieved_texts, [], type="audio")
+        answer = ask(query_str, retrieved_texts, [], type="audio")
+        top_ctx = None
+        if retrieved_texts:
+            top_ctx = {
+                "type": "audio",
+                "text": retrieved_texts[0],
+                "file_path": ctx.file_path if hasattr(ctx, "file_path") else None,
+            }
+        return answer, top_ctx
 
     if ctx.rag_type == "document":
         retrieved_texts = text_retrieval(query_str, ctx.text_collection, top_k=3)
-        return ask(query_str, retrieved_texts, type="document")
+        answer = ask(query_str, retrieved_texts, type="document")
+        top_ctx = None
+        if retrieved_texts:
+            top_ctx = {"type": "document", "text": retrieved_texts[0]}
+        return answer, top_ctx
 
     if ctx.rag_type == "image":
-        return ask(query_str, [], ctx.image_data, type="image")
+        answer = ask(query_str, [], ctx.image_data, type="image")
+        top_ctx = None
+        if ctx.image_data:
+            top_ctx = {"type": "image", "b64": ctx.image_data[0].get("b64", "")}
+        return answer, top_ctx
 
     raise ValueError(f"Unknown RAG type: {ctx.rag_type!r}")
 
@@ -141,16 +178,20 @@ def query(ctx: RagContext, query_str: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def video_rag_system(video_url: str, query_str: str, rag: str = "video") -> str:
-    return query(ingest_video(video_url), query_str)
+    answer, _ = query(ingest_video(video_url), query_str)
+    return answer
 
 
 def audio_rag_system(audio_path: str, query_str: str, rag: str = "audio") -> str:
-    return query(ingest_audio(audio_path), query_str)
+    answer, _ = query(ingest_audio(audio_path), query_str)
+    return answer
 
 
 def image_rag_system(img_url: str, query_str: str, rag: str = "image") -> str:
-    return query(ingest_image(img_url), query_str)
+    answer, _ = query(ingest_image(img_url), query_str)
+    return answer
 
 
 def document_rag_system(doc_url: str, query_str: str, rag: str = "document") -> str:
-    return query(ingest_document(doc_url), query_str)
+    answer, _ = query(ingest_document(doc_url), query_str)
+    return answer

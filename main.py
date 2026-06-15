@@ -1,33 +1,3 @@
-# from app import main as caller
-
-
-# if __name__ == "__main__":
-#     # query="what's the song all about?"
-#     rag= input("which RAG system do you want to test? (video/audio/image/document): ")
-#     path=input("Enter the file path or URL of the content: ")
-#     query= input("Enter your question about the content: ")
-#     while True:
-#         if query.lower() == "exit":
-#             print("Exiting the RAG system. Goodbye!")
-#             break
-#         if rag.lower() == "video":
-            
-#             response=caller.video_rag_system(path, query, rag)
-#         elif rag.lower() == "audio":
-#             response=caller.audio_rag_system(path, query, rag)
-#         elif rag.lower() == "image":
-#             response=caller.image_rag_system(path, query, rag)
-#         elif rag.lower() == "document":
-#             response=caller.document_rag_system(path, query, rag)
-#         else:
-#             print("Invalid RAG type. Please choose from video/audio/image/document.")
-#             continue
-#         print("\n---\n")
-#         query= response
-        
-
-
-
 
 
 """
@@ -45,10 +15,18 @@ Fixes applied
 """
 
 import os
+import sys
 import time
+import asyncio
 import tempfile
 import streamlit as st
 from pathlib import Path
+
+# On Windows, Python 3.8+ defaults to ProactorEventLoop which logs a spurious
+# ConnectionResetError when the remote side (e.g. Groq API) closes a TCP
+# connection normally. Switching to SelectorEventLoop silences it.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ── RAG backend ───────────────────────────────────────────────────────────────
 # The backend pulls in torch + CLIP, which takes ~40s to import. Importing it at
@@ -511,15 +489,19 @@ def _ensure_ingested(rag_type: str, file_path: str):
     return ctx
 
 
-def _answer_query(rag_type: str, file_path: str, query: str) -> str:
-    """Answer a single question, ingesting the file first if needed."""
+def _answer_query(rag_type: str, file_path: str, query: str) -> tuple:
+    """Answer a single question, ingesting the file first if needed.
+
+    Returns (answer: str, top_context: dict | None).
+    """
     caller = _get_caller()
     if not CALLER_AVAILABLE or caller is None:
         time.sleep(1.0)
         return (
             f"**[Demo mode]** `app.main` could not be imported — connect your backend to get real answers.\n\n"
             f"**Mode:** {rag_type}  |  **File:** `{Path(file_path).name}`\n\n"
-            f"**Query:** {query}"
+            f"**Query:** {query}",
+            None,
         )
 
     ctx = _ensure_ingested(rag_type, file_path)
@@ -670,17 +652,23 @@ if st.session_state.pending_query and st.session_state.file_ready:
     st.session_state.processing    = True
 
     try:
-        _response = _answer_query(
+        _result = _answer_query(
             rag_type  = st.session_state.rag_type,
             file_path = st.session_state.file_path,
             query     = _q,
         )
+        # _answer_query returns (answer, top_context) or a bare string in demo mode
+        if isinstance(_result, tuple):
+            _response, _top_ctx = _result
+        else:
+            _response, _top_ctx = _result, None
     except Exception as _exc:
-        _response = f"⚠️ An error occurred: {_exc}"
+        _response, _top_ctx = f"⚠️ An error occurred: {_exc}", None
 
     st.session_state.messages.append({
         "role":    "assistant",
         "content": _response,
+        "top_ctx": _top_ctx,
         "ts":      time.strftime("%H:%M"),
     })
     st.session_state.processing = False
@@ -779,6 +767,59 @@ with chat_placeholder:
                     f'</div></div>',
                     unsafe_allow_html=True,
                 )
+                # ── Top-1 context panel ───────────────────────────────────
+                top_ctx = msg.get("top_ctx")
+                if top_ctx:
+                    ctx_type = top_ctx.get("type")
+                    # Constrain panel to ~40% of the chat column width
+                    _panel_col, _spacer = st.columns([4, 6])
+                    with _panel_col:
+                        if ctx_type == "video":
+                            ts = top_ctx.get("timestamp")
+                            fp = top_ctx.get("file_path")
+                            if fp and os.path.exists(fp):
+                                ts_label = f" @ {ts:.1f}s" if ts is not None else ""
+                                with st.expander(f"▶ Retrieved context{ts_label}", expanded=True):
+                                    st.markdown(
+                                        '<div style="max-height:220px;overflow:hidden;border-radius:8px;">',
+                                        unsafe_allow_html=True,
+                                    )
+                                    start_time = int(ts) if ts is not None else 0
+                                    st.video(fp, start_time=start_time)
+                                    st.markdown('</div>', unsafe_allow_html=True)
+                        elif ctx_type == "audio":
+                            fp  = top_ctx.get("file_path")
+                            txt = top_ctx.get("text", "")
+                            if fp and os.path.exists(fp):
+                                with st.expander("🎙 Retrieved context", expanded=True):
+                                    st.audio(fp)
+                                    if txt:
+                                        st.caption(
+                                            f'"{txt[:200]}…"' if len(txt) > 200 else f'"{txt}"'
+                                        )
+                        elif ctx_type == "document":
+                            txt = top_ctx.get("text", "")
+                            if txt:
+                                with st.expander("📄 Retrieved passage", expanded=True):
+                                    st.markdown(
+                                        f'<div style="background:var(--bg-input);border:1px solid var(--border);'
+                                        f'border-radius:var(--radius-md);padding:10px 14px;'
+                                        f'font-size:.82rem;line-height:1.6;color:var(--text-muted);'
+                                        f'max-height:160px;overflow-y:auto;">'
+                                        f'{txt[:400]}{"…" if len(txt) > 400 else ""}'
+                                        f'</div>',
+                                        unsafe_allow_html=True,
+                                    )
+                        elif ctx_type == "image":
+                            b64 = top_ctx.get("b64", "")
+                            if b64:
+                                with st.expander("🖼 Source image", expanded=True):
+                                    st.markdown(
+                                        '<div style="max-height:200px;overflow:hidden;border-radius:8px;">',
+                                        unsafe_allow_html=True,
+                                    )
+                                    st.image(f"data:image/jpeg;base64,{b64}", use_container_width=True)
+                                    st.markdown('</div>', unsafe_allow_html=True)
 
         # ── Animated thinking dots while RAG runs ─────────────────────────
         if st.session_state.processing:
@@ -803,7 +844,6 @@ with chat_placeholder:
 # INPUT BAR  — single-click, auto-clear
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="input-bar-wrap">', unsafe_allow_html=True)
-input_col, btn_col = st.columns([9, 1])
 
 file_ready = bool(mode and st.session_state.file_ready)
 is_busy    = st.session_state.processing
@@ -813,40 +853,42 @@ placeholder_txt = (
     if file_ready else "Upload a file to start chatting…"
 )
 
-with input_col:
-    # Key rotates after every send → Streamlit creates a fresh widget → field is blank
-    current_input = st.text_input(
-        label="Query",
-        placeholder=placeholder_txt,
-        label_visibility="collapsed",
-        disabled=not file_ready or is_busy,
-        key=f"query_input_{st.session_state.input_key}",
-    )
-
-with btn_col:
-    can_send = file_ready and not is_busy and bool(current_input and current_input.strip())
-    send_clicked = st.button(
-        "⟩ Send" if not is_busy else "…",
-        disabled=not can_send,
-        key="send_btn",
-    )
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-# ── On send: store query, clear input (rotate key), set processing flag, rerun ─
-if send_clicked and can_send:
-    _query_text = current_input.strip()
-
-    # Record user message immediately
+def _submit_query(text: str):
+    """Shared logic for submitting a query (Enter key or button click)."""
+    text = text.strip()
+    if not text:
+        return
     st.session_state.messages.append({
         "role":    "user",
-        "content": _query_text,
+        "content": text,
         "ts":      time.strftime("%H:%M"),
     })
-
-    # Schedule execution and clear the input field
-    st.session_state.pending_query = _query_text
+    st.session_state.pending_query = text
     st.session_state.processing    = True
     st.session_state.input_key    += 1   # rotate key → widget re-creates blank
 
+
+with st.form(key=f"chat_form_{st.session_state.input_key}", clear_on_submit=True):
+    form_col, form_btn = st.columns([9, 1])
+    with form_col:
+        current_input = st.text_input(
+            label="Query",
+            placeholder=placeholder_txt,
+            label_visibility="collapsed",
+            disabled=not file_ready or is_busy,
+            key=f"query_input_{st.session_state.input_key}",
+        )
+    with form_btn:
+        send_clicked = st.form_submit_button(
+            "⟩ Send" if not is_busy else "…",
+            disabled=is_busy,
+            use_container_width=True,
+        )
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ── On Enter or button: submit the query ─────────────────────────────────────
+can_send = file_ready and not is_busy and bool(current_input and current_input.strip())
+if send_clicked and can_send:
+    _submit_query(current_input)
     st.rerun()

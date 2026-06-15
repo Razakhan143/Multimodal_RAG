@@ -1,4 +1,4 @@
-from langchain_community.document_loaders import TextLoader,PyMuPDFLoader,WebBaseLoader
+from langchain_community.document_loaders import TextLoader, PyMuPDFLoader, Docx2txtLoader
 import os
 
 
@@ -43,25 +43,31 @@ def text_splitter(documents):
 
 
 
+def docx_loader(file_path: str):
+    try:
+        print("loading DOCX Document")
+        loader = Docx2txtLoader(file_path)
+        documents = loader.load()
+        return documents
+    except Exception as e:
+        print(f"Error in load_docs.py (docx_loader): {e}")
+        raise e
+
+
 def get_document_loader(file_path: str):
     """
     Selects and initializes the appropriate document loader based on the file extension.
     """
-    # 1. Extract the file extension and convert to lowercase
     _, extension = os.path.splitext(file_path)
     extension = extension.lower()
 
-    # 2. Map extensions to their respective LangChain Loader classes
     loader_mapping = {
-        '.pdf': pdf_loader,
-        '.txt': document_loader
-
+        '.pdf':  pdf_loader,
+        '.txt':  document_loader,
+        '.docx': docx_loader,
     }
 
-    # 3. Check if the extension is supported
     if extension not in loader_mapping:
         raise ValueError(f"Unsupported file extension: '{extension}'. Please provide a valid document.")
 
-    # 4. Initialize and return the correct loader with the file path
-    loader_class = loader_mapping[extension]
-    return loader_class(file_path)
+    return loader_mapping[extension](file_path)
