@@ -27,13 +27,14 @@ import warnings
 # ConnectionResetError when the remote side (e.g. Groq API) closes a TCP
 # connection normally. Switching to SelectorEventLoop silences it.
 if sys.platform == "win32":
-    # Use SelectorEventLoop to avoid spurious ConnectionResetError logs on Windows.
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     # Suppress deprecation warnings from asyncio on Windows (scheduled for removal).
     warnings.filterwarnings("ignore", category=DeprecationWarning, module="asyncio")
-    # Install a custom exception handler that silently ignores ConnectionResetError
-    # which can be raised when remote services close sockets normally.
-    loop = asyncio.get_event_loop()
+    # Create a fresh event loop for this thread (the default ProactorEventLoop is fine).
+    # This avoids calling ``asyncio.get_event_loop()`` which raises RuntimeError in
+    # the Streamlit script thread when no loop is set.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     def _handle_asyncio_exception(loop, context):
         exc = context.get("exception")
         if isinstance(exc, ConnectionResetError):
@@ -41,6 +42,7 @@ if sys.platform == "win32":
             return
         # For all other exceptions, use the default handler.
         loop.default_exception_handler(context)
+
     loop.set_exception_handler(_handle_asyncio_exception)
 
 # ── RAG backend ───────────────────────────────────────────────────────────────
