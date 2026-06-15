@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.processors import audio_transcribe
-from app.retrieval.search_service import ask
-from app.retrieval.ranking import video_retrival, text_retrieval
+from app.retrieval.search_service import ask, rewrite_query
+from app.retrieval.ranking import text_retrieval, image_retrieval, WEAK_DISTANCE
 from app.processors.video_processor import process_video
 from app.vectordb.repository import populate_text, populate_video_images
 from app.chroma_db.db import get_collections
@@ -26,7 +26,20 @@ from app.processors.image_captioner import encode_image_to_base64
 
 # Paths produced by the video processor (frames + extracted audio + transcript).
 AUDIO_OUT = "app/ingestion/audio_ingess/audio.mp3"
-TRANSCRIPT_OUT = "app/ingestion/audio_ingess/transcript.txt"
+
+# If the entire transcript/document fits comfortably in the LLM context, skip
+# retrieval and pass everything. This eliminates "insufficient evidence" misses
+# on small files and removes retrieval latency entirely for them.
+SMALL_CONTENT_CHARS = 6000
+
+
+def _document_text(document) -> str:
+    """Flatten a LangChain document (or list) to a single plain string."""
+    if document is None:
+        return ""
+    if isinstance(document, (list, tuple)):
+        return "\n\n".join(getattr(d, "page_content", str(d)) for d in document)
+    return getattr(document, "page_content", str(document))
 
 
 @dataclass
@@ -42,6 +55,8 @@ class RagContext:
     frame_timestamps: dict = field(default_factory=dict)
     image_data: list = field(default_factory=list)   # for image mode (b64 payloads)
     file_path: str = None                             # original uploaded file path
+    full_text: str = ""                               # whole transcript/doc (bypass)
+    segments: list = field(default_factory=list)      # Whisper timestamped segments
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -54,10 +69,10 @@ def ingest_video(video_path: str) -> RagContext:
     frame_timestamps = process_video(video_path)
 
     transcript = audio_transcribe.transcribe_audio(AUDIO_OUT)
-    document = get_document_loader(file_path=TRANSCRIPT_OUT) if transcript else None
+    segments = audio_transcribe.load_segments()
 
     text_collection, image_collection = get_collections()
-    text_collection = populate_text(document, text_collection) or text_collection
+    text_collection = populate_text(transcript, text_collection, segments=segments) or text_collection
     image_collection = populate_video_images(image_collection, frame_timestamps)
 
     return RagContext(
@@ -66,6 +81,8 @@ def ingest_video(video_path: str) -> RagContext:
         image_collection=image_collection,
         frame_timestamps=frame_timestamps,
         file_path=video_path,
+        full_text=transcript or "",
+        segments=segments,
     )
 
 
@@ -73,12 +90,18 @@ def ingest_audio(audio_path: str) -> RagContext:
     """Transcribe an audio file once and embed + store the transcript."""
     print(f"Ingesting audio: {audio_path}")
     transcript = audio_transcribe.transcribe_audio(audio_path)
-    document = get_document_loader(file_path=TRANSCRIPT_OUT) if transcript else None
+    segments = audio_transcribe.load_segments()
 
     text_collection, _ = get_collections()
-    text_collection = populate_text(document, text_collection) or text_collection
+    text_collection = populate_text(transcript, text_collection, segments=segments) or text_collection
 
-    return RagContext(rag_type="audio", text_collection=text_collection, file_path=audio_path)
+    return RagContext(
+        rag_type="audio",
+        text_collection=text_collection,
+        file_path=audio_path,
+        full_text=transcript or "",
+        segments=segments,
+    )
 
 
 def ingest_document(doc_path: str) -> RagContext:
@@ -88,7 +111,12 @@ def ingest_document(doc_path: str) -> RagContext:
     text_collection, _ = get_collections()
     text_collection = populate_text(document, text_collection) or text_collection
 
-    return RagContext(rag_type="document", text_collection=text_collection, file_path=doc_path)
+    return RagContext(
+        rag_type="document",
+        text_collection=text_collection,
+        file_path=doc_path,
+        full_text=_document_text(document),
+    )
 
 
 def ingest_image(img_path: str) -> RagContext:
@@ -115,6 +143,41 @@ def ingest(rag_type: str, file_path: str) -> RagContext:
 # QUERYING  — light, runs for every follow-up question
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _retrieve_text(ctx: RagContext, query_str: str, top_k: int):
+    """Retrieve text with a Self-RAG-lite rewrite fallback.
+
+    1. Retrieve once with the user's query.
+    2. Grade the best hit by embedding distance (free — no LLM call).
+    3. Only if the match is weak, spend ONE cheap LLM call to rewrite the query
+       and retrieve again, then keep whichever pass had the closer match.
+
+    This bounds the extra latency to a single small-model call, and only on the
+    hard queries that actually need it. Returns (texts, hits).
+    """
+    texts, hits, best = text_retrieval(query_str, ctx.text_collection, top_k=top_k)
+
+    if best <= WEAK_DISTANCE:
+        return texts, hits   # strong match — answer immediately, no rewrite
+
+    # Weak retrieval → one rewrite + re-retrieve.
+    print(f"🔎 Weak retrieval (dist={best:.3f}); rewriting query…")
+    rq = rewrite_query(query_str)
+    if rq and rq.lower() != query_str.lower():
+        texts2, hits2, best2 = text_retrieval(rq, ctx.text_collection, top_k=top_k)
+        if best2 < best:
+            return texts2, hits2
+    return texts, hits
+
+
+def _top_timestamp(hits: list):
+    """First non-None timestamp among ranked hits (where the answer is spoken)."""
+    for h in hits:
+        ts = h.get("timestamp")
+        if ts is not None:
+            return ts
+    return None
+
+
 def query(ctx: RagContext, query_str: str) -> tuple:
     """Answer a question using an already-ingested ``RagContext``.
 
@@ -122,45 +185,60 @@ def query(ctx: RagContext, query_str: str) -> tuple:
     -------
     (answer: str, top_context: dict | None)
         top_context keys vary by type:
-          video  → {"type": "video",    "timestamp": float, "file_path": str}
-          audio  → {"type": "audio",    "timestamp": float | None, "file_path": str}
+          video    → {"type": "video",    "timestamp": float, "file_path": str}
+          audio    → {"type": "audio",    "text": str, "file_path": str}
           document → {"type": "document", "text": str}
-          image  → {"type": "image",    "b64": str}
+          image    → {"type": "image",    "b64": str}
     """
     if ctx.rag_type == "video":
-        retrieved_texts, retrieved_images = video_retrival(
-            query_str, ctx.text_collection, ctx.image_collection,
-            ctx.frame_timestamps, top_k=5,
-        )
+        small = 0 < len(ctx.full_text) <= SMALL_CONTENT_CHARS
+        if small:
+            # Whole transcript fits — pass it all; still pull frames for vision.
+            retrieved_texts = [ctx.full_text]
+            hits = []
+        else:
+            retrieved_texts, hits = _retrieve_text(ctx, query_str, top_k=5)
+
+        retrieved_images = image_retrieval(query_str, ctx.image_collection, top_k=3)
         answer = ask(query_str, retrieved_texts, retrieved_images, type="video")
-        top_ctx = None
-        if retrieved_images:
-            top = retrieved_images[0]
-            top_ctx = {
-                "type": "video",
-                "timestamp": top.get("timestamp"),
-                "file_path": ctx.file_path if hasattr(ctx, "file_path") else None,
-            }
+
+        # Timestamp priority: the transcript chunk that answers the query (where
+        # it is *spoken*), falling back to the visually-matched frame.
+        ts = _top_timestamp(hits)
+        if ts is None and retrieved_images:
+            ts = retrieved_images[0].get("timestamp")
+        top_ctx = {"type": "video", "timestamp": ts, "file_path": ctx.file_path}
         return answer, top_ctx
 
     if ctx.rag_type == "audio":
-        retrieved_texts = text_retrieval(query_str, ctx.text_collection, top_k=3)
+        small = 0 < len(ctx.full_text) <= SMALL_CONTENT_CHARS
+        if small:
+            retrieved_texts, hits = [ctx.full_text], []
+        else:
+            retrieved_texts, hits = _retrieve_text(ctx, query_str, top_k=3)
+
         answer = ask(query_str, retrieved_texts, [], type="audio")
-        top_ctx = None
-        if retrieved_texts:
-            top_ctx = {
-                "type": "audio",
-                "text": retrieved_texts[0],
-                "file_path": ctx.file_path if hasattr(ctx, "file_path") else None,
-            }
+        top_ctx = {
+            "type": "audio",
+            "text": retrieved_texts[0] if retrieved_texts else "",
+            "timestamp": _top_timestamp(hits),
+            "file_path": ctx.file_path,
+        }
         return answer, top_ctx
 
     if ctx.rag_type == "document":
-        retrieved_texts = text_retrieval(query_str, ctx.text_collection, top_k=3)
+        small = 0 < len(ctx.full_text) <= SMALL_CONTENT_CHARS
+        if small:
+            retrieved_texts, hits = [ctx.full_text], []
+        else:
+            retrieved_texts, hits = _retrieve_text(ctx, query_str, top_k=4)
+
         answer = ask(query_str, retrieved_texts, type="document")
         top_ctx = None
         if retrieved_texts:
-            top_ctx = {"type": "document", "text": retrieved_texts[0]}
+            # Show the top retrieved chunk, not the whole bypassed transcript.
+            snippet = hits[0]["text"] if hits else retrieved_texts[0]
+            top_ctx = {"type": "document", "text": snippet}
         return answer, top_ctx
 
     if ctx.rag_type == "image":

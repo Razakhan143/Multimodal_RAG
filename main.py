@@ -21,12 +21,27 @@ import asyncio
 import tempfile
 import streamlit as st
 from pathlib import Path
+import warnings
 
 # On Windows, Python 3.8+ defaults to ProactorEventLoop which logs a spurious
 # ConnectionResetError when the remote side (e.g. Groq API) closes a TCP
 # connection normally. Switching to SelectorEventLoop silences it.
 if sys.platform == "win32":
+    # Use SelectorEventLoop to avoid spurious ConnectionResetError logs on Windows.
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Suppress deprecation warnings from asyncio on Windows (scheduled for removal).
+    warnings.filterwarnings("ignore", category=DeprecationWarning, module="asyncio")
+    # Install a custom exception handler that silently ignores ConnectionResetError
+    # which can be raised when remote services close sockets normally.
+    loop = asyncio.get_event_loop()
+    def _handle_asyncio_exception(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, ConnectionResetError):
+            # Silently ignore; this is expected during normal shutdown of remote APIs.
+            return
+        # For all other exceptions, use the default handler.
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(_handle_asyncio_exception)
 
 # ── RAG backend ───────────────────────────────────────────────────────────────
 # The backend pulls in torch + CLIP, which takes ~40s to import. Importing it at
@@ -772,7 +787,8 @@ with chat_placeholder:
                 if top_ctx:
                     ctx_type = top_ctx.get("type")
                     # Constrain panel to ~40% of the chat column width
-                    _panel_col, _spacer = st.columns([4, 6])
+                    # Use a narrower panel (~30% width) to avoid covering the whole screen.
+                    _panel_col, _spacer = st.columns([3, 7])
                     with _panel_col:
                         if ctx_type == "video":
                             ts = top_ctx.get("timestamp")
@@ -781,7 +797,7 @@ with chat_placeholder:
                                 ts_label = f" @ {ts:.1f}s" if ts is not None else ""
                                 with st.expander(f"▶ Retrieved context{ts_label}", expanded=True):
                                     st.markdown(
-                                        '<div style="max-height:220px;overflow:hidden;border-radius:8px;">',
+                                        '<div style="max-height:220px;max-width:400px;overflow:hidden;border-radius:8px;">',
                                         unsafe_allow_html=True,
                                     )
                                     start_time = int(ts) if ts is not None else 0
@@ -790,9 +806,11 @@ with chat_placeholder:
                         elif ctx_type == "audio":
                             fp  = top_ctx.get("file_path")
                             txt = top_ctx.get("text", "")
+                            ats = top_ctx.get("timestamp")
                             if fp and os.path.exists(fp):
-                                with st.expander("🎙 Retrieved context", expanded=True):
-                                    st.audio(fp)
+                                ts_label = f" @ {ats:.1f}s" if ats is not None else ""
+                                with st.expander(f"🎙 Retrieved context{ts_label}", expanded=True):
+                                    st.audio(fp, start_time=int(ats) if ats is not None else 0)
                                     if txt:
                                         st.caption(
                                             f'"{txt[:200]}…"' if len(txt) > 200 else f'"{txt}"'
@@ -802,10 +820,10 @@ with chat_placeholder:
                             if txt:
                                 with st.expander("📄 Retrieved passage", expanded=True):
                                     st.markdown(
-                                        f'<div style="background:var(--bg-input);border:1px solid var(--border);'
+                                        '<div style="background:var(--bg-input);border:1px solid var(--border);'
                                         f'border-radius:var(--radius-md);padding:10px 14px;'
                                         f'font-size:.82rem;line-height:1.6;color:var(--text-muted);'
-                                        f'max-height:160px;overflow-y:auto;">'
+                                        f'max-height:160px;max-width:400px;overflow-y:auto;">'
                                         f'{txt[:400]}{"…" if len(txt) > 400 else ""}'
                                         f'</div>',
                                         unsafe_allow_html=True,
@@ -815,7 +833,7 @@ with chat_placeholder:
                             if b64:
                                 with st.expander("🖼 Source image", expanded=True):
                                     st.markdown(
-                                        '<div style="max-height:200px;overflow:hidden;border-radius:8px;">',
+                                        '<div style="max-height:200px;max-width:400px;overflow:hidden;border-radius:8px;">',
                                         unsafe_allow_html=True,
                                     )
                                     st.image(f"data:image/jpeg;base64,{b64}", use_container_width=True)

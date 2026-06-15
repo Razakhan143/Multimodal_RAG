@@ -2,8 +2,8 @@
 # Match the 25 MB cap enforced in the app so Streamlit rejects oversized
 # uploads before they reach your code.
 maxUploadSize = 25
-enableXsrfProtection = true
-enableCORS = false
+enableXsrfProtection = false
+enableCORS = true
 
 [browser]
 gatherUsageStats = false
