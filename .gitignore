@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv/
+venv/
+env/
+
+# Secrets — NEVER commit these
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Local vector store (rebuilt at runtime)
+chromadb_store/
+app/chroma_db/chroma_db/
+app/chroma_db/*.sqlite3
+
+# Runtime-generated media (frames, extracted audio, transcripts)
+app/ingestion/audio_ingess/*.mp3
+app/ingestion/audio_ingess/*.wav
+app/ingestion/audio_ingess/*.txt
+app/ingestion/video_ingess/*.png
+app/ingestion/video_ingess/*.json
+
+# Large sample data / notebooks not needed for deploy
+data/
+*.pdf
+*.ipynb
+
+# uv / local Python pin — kept off Cloud so its py3.14 constraint doesn't break
+# the build. Streamlit Cloud uses requirements.txt; pick Python 3.13 in the
+# dashboard's Advanced settings instead.
+pyproject.toml
+uv.lock
+.python-version
+
+# OS noise
+.DS_Store
+Thumbs.db

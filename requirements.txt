@@ -1,0 +1,36 @@
+# ── PyTorch: CPU-only build ───────────────────────────────────────────────────
+# Streamlit Community Cloud has no GPU. The default torch wheel drags in ~2.5 GB
+# of CUDA libraries that won't fit in the free tier and can't be used anyway.
+# The extra-index line points pip at the CPU wheels, and the "+cpu" tag forces
+# the CPU build (a bare "torch==2.12.0" can still resolve to the CUDA wheel).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.0+cpu
+
+# ── App framework ─────────────────────────────────────────────────────────────
+streamlit==1.58.0
+
+# ── Multimodal embeddings (CLIP) ──────────────────────────────────────────────
+open-clip-torch==3.3.0
+pillow==11.3.0
+numpy==2.4.6
+
+# ── Vector store ──────────────────────────────────────────────────────────────
+chromadb==1.5.9
+
+# ── LLM + RAG orchestration (Groq) ────────────────────────────────────────────
+langchain==1.3.7
+langchain-core==1.4.6
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
+langchain-groq==1.1.3
+groq==0.37.1
+
+# ── Document loading ──────────────────────────────────────────────────────────
+pymupdf==1.27.2.3
+
+# ── Audio / video processing ──────────────────────────────────────────────────
+moviepy==2.2.1
+imageio-ffmpeg==0.6.0
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv==1.2.2

@@ -1,0 +1,17 @@
+[server]
+# Match the 25 MB cap enforced in the app so Streamlit rejects oversized
+# uploads before they reach your code.
+maxUploadSize = 25
+enableXsrfProtection = true
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#6C63FF"
+backgroundColor = "#0D0F1A"
+secondaryBackgroundColor = "#13162A"
+textColor = "#E8EAF6"
+font = "sans serif"
